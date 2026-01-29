@@ -1,9 +1,9 @@
-// Example: exercising multiple tools and an MCP server.
+// Example: exercising multiple tools and an MCP server with real-time output.
 //
 // This demo configures the Context7 MCP server (live documentation lookup),
 // then asks Claude a prompt designed to trigger several built-in tools
-// (Read, Bash, Grep) plus the MCP tool. The session hooks log every tool
-// invocation in real time, and a post-run summary shows what happened.
+// (Read, Bash, Grep) plus the MCP tool. Real-time streaming output shows
+// text as it arrives and tool invocations in color.
 package main
 
 import (
@@ -12,23 +12,50 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	claude "github.com/MateoSegura/claudesdk-go"
 )
 
+// ANSI color codes
+const (
+	reset   = "\033[0m"
+	bold    = "\033[1m"
+	dim     = "\033[2m"
+	red     = "\033[31m"
+	green   = "\033[32m"
+	yellow  = "\033[33m"
+	blue    = "\033[34m"
+	magenta = "\033[35m"
+	cyan    = "\033[36m"
+	white   = "\033[37m"
+)
+
+// toolColor returns a consistent color for a tool name.
+func toolColor(name string) string {
+	switch {
+	case name == "Bash":
+		return green
+	case name == "Read":
+		return cyan
+	case name == "Write" || name == "Edit":
+		return yellow
+	case name == "Grep" || name == "Glob":
+		return magenta
+	case strings.HasPrefix(name, "mcp__"):
+		return blue
+	default:
+		return white
+	}
+}
+
 func main() {
 	if !claude.CLIAvailable() {
 		log.Fatal("Claude CLI not found in PATH")
 	}
 
-	// ---------------------------------------------------------------
-	// Prompt crafted to exercise multiple tool categories:
-	//   1. Context7 MCP  – look up live library documentation
-	//   2. Bash          – run a shell command
-	//   3. Read / Grep   – inspect local files
-	// ---------------------------------------------------------------
 	prompt := `Do the following steps in order:
 
 1. Use the Context7 MCP server to look up the latest documentation for the
@@ -49,9 +76,14 @@ func main() {
 		prompt = os.Args[1]
 	}
 
-	// Track tool usage
+	// Track stats
 	toolCalls := make(map[string]int)
 	filesAccessed := []string{}
+	startTime := time.Now()
+
+	// Header
+	fmt.Fprintf(os.Stderr, "\n%s%s claudesdk-go tools example %s\n", bold, cyan, reset)
+	fmt.Fprintf(os.Stderr, "%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n\n", dim, reset)
 
 	session, err := claude.NewSession(claude.SessionConfig{
 		SkipPermissions: true,
@@ -59,8 +91,6 @@ func main() {
 		Timeout:         5 * time.Minute,
 		MaxTurns:        15,
 
-		// ---- MCP server configuration ----
-		// Context7 provides live, up-to-date library documentation.
 		MCPServers: map[string]claude.MCPServer{
 			"context7": {
 				Command: "npx",
@@ -70,14 +100,64 @@ func main() {
 
 		Hooks: &claude.Hooks{
 			OnStart: func(pid int) {
-				fmt.Fprintf(os.Stderr, "[Started: PID %d]\n", pid)
+				fmt.Fprintf(os.Stderr, "%s%s PID %d %s\n\n", dim, green, pid, reset)
 			},
 			OnToolCall: func(name string, input map[string]any) {
 				toolCalls[name]++
-				fmt.Fprintf(os.Stderr, "[Tool: %s]\n", name)
+				color := toolColor(name)
+
+				// Clean up MCP tool names for display
+				displayName := name
+				if strings.HasPrefix(name, "mcp__") {
+					parts := strings.Split(name, "__")
+					if len(parts) >= 3 {
+						displayName = fmt.Sprintf("%s → %s", parts[1], parts[2])
+					}
+				}
+
+				// Show a one-line summary depending on tool type
+				detail := ""
+				switch name {
+				case "Bash":
+					if cmd, ok := input["command"].(string); ok {
+						cmd = strings.Split(cmd, "\n")[0]
+						if len(cmd) > 60 {
+							cmd = cmd[:57] + "..."
+						}
+						detail = fmt.Sprintf(" %s$ %s%s", dim, cmd, reset)
+					}
+				case "Read":
+					if fp, ok := input["file_path"].(string); ok {
+						detail = fmt.Sprintf(" %s%s%s", dim, fp, reset)
+						filesAccessed = append(filesAccessed, fp)
+					}
+				case "Write", "Edit":
+					if fp, ok := input["file_path"].(string); ok {
+						detail = fmt.Sprintf(" %s%s%s", dim, fp, reset)
+						filesAccessed = append(filesAccessed, fp)
+					}
+				case "Grep", "Glob":
+					if p, ok := input["pattern"].(string); ok {
+						detail = fmt.Sprintf(" %s%s%s", dim, p, reset)
+					}
+				default:
+					if strings.HasPrefix(name, "mcp__") {
+						if q, ok := input["query"].(string); ok {
+							if len(q) > 50 {
+								q = q[:47] + "..."
+							}
+							detail = fmt.Sprintf(" %s\"%s\"%s", dim, q, reset)
+						}
+						if lib, ok := input["libraryName"].(string); ok {
+							detail = fmt.Sprintf(" %s%s%s", dim, lib, reset)
+						}
+					}
+				}
+
+				fmt.Fprintf(os.Stderr, "  %s%s● %s%s%s\n", color, bold, displayName, reset, detail)
 			},
 			OnExit: func(code int, duration time.Duration) {
-				fmt.Fprintf(os.Stderr, "[Exited: code=%d duration=%s]\n", code, duration)
+				fmt.Fprintf(os.Stderr, "\n")
 			},
 		},
 	})
@@ -85,7 +165,7 @@ func main() {
 		log.Fatalf("Failed to create session: %v", err)
 	}
 
-	// Handle Ctrl+C gracefully
+	// Handle Ctrl+C
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -93,62 +173,79 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		fmt.Fprintf(os.Stderr, "\n[Interrupting...]\n")
+		fmt.Fprintf(os.Stderr, "\n%s[Interrupting...]%s\n", yellow, reset)
 		session.Interrupt()
 		cancel()
 	}()
 
-	// Run and collect full result
-	result, err := session.RunAndCollect(ctx, prompt)
-	if err != nil {
-		log.Fatalf("Session failed: %v", err)
+	// Start streaming
+	if err := session.Run(ctx, prompt); err != nil {
+		log.Fatalf("Failed to start: %v", err)
 	}
 
-	// Analyze tool usage from messages
-	for _, msg := range result.Messages {
-		if files := claude.ExtractAllFileAccess(&msg); len(files) > 0 {
-			filesAccessed = append(filesAccessed, files...)
-		}
-
-		if todos := claude.ExtractTodos(&msg); len(todos) > 0 {
-			fmt.Fprintf(os.Stderr, "[Todos created: %d]\n", len(todos))
-			for _, todo := range todos {
-				fmt.Fprintf(os.Stderr, "  - %s (%s)\n", todo.Content, todo.Status)
+	// Print text in real time, tools via hooks above
+	var fullText strings.Builder
+	for {
+		select {
+		case msg, ok := <-session.Messages:
+			if !ok {
+				goto done
 			}
-		}
 
-		if cmd := claude.ExtractBashCommand(&msg); cmd != "" {
-			fmt.Fprintf(os.Stderr, "[Bash: %s]\n", truncate(cmd, 80))
+			if msg.Type == "assistant" {
+				if text := claude.ExtractText(&msg); text != "" {
+					fmt.Print(text)
+					fullText.WriteString(text)
+				}
+			}
+
+			// Capture result metrics
+			if claude.IsResult(&msg) {
+				// Summary banner
+				elapsed := time.Since(startTime)
+				fmt.Fprintf(os.Stderr, "%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n", dim, reset)
+				fmt.Fprintf(os.Stderr, "%s%s Summary%s\n", bold, cyan, reset)
+				fmt.Fprintf(os.Stderr, "  Duration   %s%s%s\n", white, elapsed.Round(time.Millisecond), reset)
+				fmt.Fprintf(os.Stderr, "  Cost       %s$%.6f%s\n", green, msg.TotalCost, reset)
+
+				if len(toolCalls) > 0 {
+					fmt.Fprintf(os.Stderr, "  Tools\n")
+					for tool, count := range toolCalls {
+						color := toolColor(tool)
+						displayTool := tool
+						if strings.HasPrefix(tool, "mcp__") {
+							parts := strings.Split(tool, "__")
+							if len(parts) >= 3 {
+								displayTool = fmt.Sprintf("%s → %s", parts[1], parts[2])
+							}
+						}
+						fmt.Fprintf(os.Stderr, "    %s●%s %-35s %s%dx%s\n", color, reset, displayTool, dim, count, reset)
+					}
+				}
+
+				if len(filesAccessed) > 0 {
+					fmt.Fprintf(os.Stderr, "  Files\n")
+					for _, f := range filesAccessed {
+						fmt.Fprintf(os.Stderr, "    %s→%s %s\n", cyan, reset, f)
+					}
+				}
+
+				fmt.Fprintf(os.Stderr, "%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n\n", dim, reset)
+			}
+
+		case <-session.Errors:
+			// non-fatal, continue
+
+		case <-session.Done():
+			goto done
+
+		case <-ctx.Done():
+			goto done
 		}
 	}
 
-	// Print Claude's response
-	fmt.Println(result.Text)
-
-	// Print summary to stderr
-	fmt.Fprintf(os.Stderr, "\n--- Summary ---\n")
-	fmt.Fprintf(os.Stderr, "Duration:  %s\n", result.Duration.Round(time.Millisecond))
-	fmt.Fprintf(os.Stderr, "Cost:      $%.6f\n", result.TotalCost)
-	fmt.Fprintf(os.Stderr, "Messages:  %d\n", len(result.Messages))
-
-	if len(toolCalls) > 0 {
-		fmt.Fprintf(os.Stderr, "Tools used:\n")
-		for tool, count := range toolCalls {
-			fmt.Fprintf(os.Stderr, "  - %-30s %dx\n", tool, count)
-		}
+done:
+	if err := session.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "%sSession error: %v%s\n", red, err, reset)
 	}
-
-	if len(filesAccessed) > 0 {
-		fmt.Fprintf(os.Stderr, "Files accessed:\n")
-		for _, f := range filesAccessed {
-			fmt.Fprintf(os.Stderr, "  - %s\n", f)
-		}
-	}
-}
-
-func truncate(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max-3] + "..."
 }
