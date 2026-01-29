@@ -25,8 +25,10 @@ func main() {
 
 	// Create session with timeout
 	session, err := claude.NewSession(claude.SessionConfig{
-		SkipPermissions: true,
-		Timeout:         2 * time.Minute,
+		LaunchOptions: claude.LaunchOptions{
+			SkipPermissions: true,
+			Timeout:         2 * time.Minute,
+		},
 	})
 	if err != nil {
 		log.Fatalf("Failed to create session: %v", err)

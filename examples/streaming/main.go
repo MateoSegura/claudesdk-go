@@ -18,20 +18,26 @@ func main() {
 		log.Fatal("Claude CLI not found in PATH")
 	}
 
-	prompt := "Write a short story about a robot learning to paint. Include dialogue."
+	prompt := "Write a short story about a robot learning to paint. Include dialogue. Look up cool names online"
 	if len(os.Args) > 1 {
 		prompt = os.Args[1]
 	}
 
 	// Create session with hooks for observability
 	session, err := claude.NewSession(claude.SessionConfig{
-		SkipPermissions: true,
-		Hooks: &claude.Hooks{
-			OnStart: func(pid int) {
-				fmt.Fprintf(os.Stderr, "[Started: PID %d]\n", pid)
-			},
-			OnExit: func(code int, duration time.Duration) {
-				fmt.Fprintf(os.Stderr, "\n[Exited: code=%d duration=%s]\n", code, duration)
+		LaunchOptions: claude.LaunchOptions{
+			SkipPermissions: true,
+			Hooks: &claude.Hooks{
+				OnStart: func(pid int) {
+					fmt.Fprintf(os.Stderr, "[Started: PID %d]\n", pid)
+				},
+				OnExit: func(code int, duration time.Duration) {
+					fmt.Fprintf(os.Stderr, "\n[Exited: code=%d duration=%s]\n", code, duration)
+				},
+				OnMetrics: func(m claude.SessionMetrics) {
+					fmt.Fprintf(os.Stderr, "[Metrics: cost=$%.6f tokens=%d+%d turns=%d]\n",
+						m.TotalCostUSD, m.InputTokens, m.OutputTokens, m.NumTurns)
+				},
 			},
 		},
 	})

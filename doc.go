@@ -1,90 +1,158 @@
 // Package claude provides a programmatic Go interface to the Claude CLI.
 //
-// This SDK offers two levels of abstraction for interacting with Claude:
+// This SDK wraps the Claude Code CLI (@anthropic-ai/claude-code) as a subprocess,
+// parsing its stream-json output into typed Go structs. Zero external dependencies.
 //
-// # Launcher (Low-Level)
+// # Two-Tier API
 //
-// Launcher provides direct control over a Claude CLI subprocess with synchronous
-// message reading. Use this when you need fine-grained control over the read loop:
+// The SDK offers two levels of abstraction:
+//
+// Session (high-level, recommended) manages goroutines internally and provides
+// Go channels for async message consumption. Four collection methods cover
+// different use cases:
+//
+//	session, err := claude.NewSession(claude.SessionConfig{
+//		LaunchOptions: claude.LaunchOptions{
+//			SkipPermissions: true,
+//			Model:           "sonnet",
+//			MaxTurns:        10,
+//		},
+//	})
+//
+//	// Simple text response
+//	text, err := session.CollectAll(ctx, "What is 2+2?")
+//
+//	// All messages with metadata
+//	msgs, err := session.CollectMessages(ctx, "Analyze this code")
+//
+//	// Full result with cost, tokens, and metrics
+//	result, err := session.RunAndCollect(ctx, "Explain recursion")
+//
+//	// Non-blocking streaming via channels
+//	session.Run(ctx, "Write a haiku")
+//	for msg := range session.Messages { ... }
+//
+// Launcher (low-level) provides synchronous message reading and direct
+// process control for custom read loops:
 //
 //	launcher := claude.NewLauncher()
-//	err := launcher.Start(ctx, "Explain quantum computing", claude.LaunchOptions{
+//	err := launcher.Start(ctx, "Explain Go interfaces", claude.LaunchOptions{
 //		SkipPermissions: true,
 //	})
-//	if err != nil {
-//		log.Fatal(err)
-//	}
 //	defer launcher.Wait()
 //
 //	for {
 //		msg, err := launcher.ReadMessage()
-//		if err != nil {
-//			log.Fatal(err)
-//		}
-//		if msg == nil {
-//			break // EOF
-//		}
-//		if text := claude.ExtractText(msg); text != "" {
-//			fmt.Print(text)
-//		}
+//		if msg == nil { break }
+//		fmt.Print(claude.ExtractText(msg))
 //	}
 //
-// # Session (High-Level)
+// # Configuration
 //
-// Session provides a channel-based async interface with managed goroutines.
-// Use this for simpler integration or when processing messages concurrently:
+// [LaunchOptions] provides 30+ fields mapping directly to CLI flags, organized
+// into categories: authentication, permissions, model/budget, system prompt,
+// session management, tools/agents, input/output, MCP servers, and debug.
 //
-//	session, err := claude.NewSession(claude.SessionConfig{
-//		WorkDir: "/path/to/project",
-//		Model:   "sonnet",
-//	})
-//	if err != nil {
-//		log.Fatal(err)
+// [SessionConfig] embeds LaunchOptions and adds session-specific fields (ID,
+// channel buffer size).
+//
+// # Permission Modes
+//
+// Four permission modes control tool approval behavior:
+//
+//   - [PermissionDefault]: Prompt for each tool on first use
+//   - [PermissionAcceptEdits]: Auto-approve file operations (Read/Edit/Write)
+//   - [PermissionPlan]: Read-only mode, no mutations or commands
+//   - [PermissionBypass]: Auto-approve all tools (use with caution)
+//
+// Granular control is available via AllowedTools and DisallowedTools with
+// glob-pattern support (e.g., "Bash(git log *)").
+//
+// # Real-Time Metrics
+//
+// Session metrics (cost, tokens, turns, model, duration) are available via:
+//
+// Synchronous polling (thread-safe):
+//
+//	metrics := session.CurrentMetrics()
+//	fmt.Printf("Cost: $%.4f, Tokens: %d+%d\n",
+//		metrics.TotalCostUSD, metrics.InputTokens, metrics.OutputTokens)
+//
+// Asynchronous push via hooks:
+//
+//	Hooks: &claude.Hooks{
+//		OnMetrics: func(m claude.SessionMetrics) {
+//			log.Printf("$%.4f | %d turns", m.TotalCostUSD, m.NumTurns)
+//		},
 //	}
 //
-//	if err := session.Run(ctx, "Write a haiku about Go"); err != nil {
-//		log.Fatal(err)
-//	}
+// # Message Extraction
 //
-//	for msg := range session.Messages {
-//		fmt.Println(claude.ExtractText(&msg))
-//	}
+// Typed helper functions extract structured data from stream messages:
 //
-// Or use the convenience method for simple request-response:
+//   - [ExtractText], [ExtractAllText]: Text content from any message type
+//   - [ExtractThinking], [ExtractAllThinking]: Reasoning/thinking blocks
+//   - [ExtractTodos]: TodoWrite tool call items
+//   - [ExtractBashCommand]: Commands from Bash tool calls
+//   - [ExtractFileAccess], [ExtractAllFileAccess]: File paths from Read/Write/Edit
+//   - [ExtractStructuredOutput]: Validated JSON from --json-schema
+//   - [ExtractUsage]: Token consumption data
+//   - [ExtractInitTools]: Available tools from init message
+//   - [GetToolName], [GetToolCall], [GetAllToolCalls]: Tool invocation details
 //
-//	text, err := session.CollectAll(ctx, "What is 2+2?")
-//	if err != nil {
-//		log.Fatal(err)
-//	}
-//	fmt.Println(text)
-//
-// # Tool Extraction
-//
-// The SDK provides helpers for extracting structured data from Claude's responses:
-//
-//   - ExtractText: Get text content from any message type
-//   - ExtractTodos: Parse TodoWrite tool calls
-//   - ExtractBashCommand: Get commands from Bash tool calls
-//   - ExtractFileAccess: Get file paths from Read/Write/Edit calls
-//   - GetToolName: Identify which tool is being invoked
+// Type predicates ([IsResult], [IsAssistant], [IsInit], etc.) simplify
+// message filtering in stream processing loops.
 //
 // # Hooks
 //
-// Optional hooks enable observability without coupling to a specific logging framework:
+// Optional [Hooks] callbacks provide observability without coupling to a logging
+// framework. Seven hooks cover the complete lifecycle:
 //
-//	session, _ := claude.NewSession(claude.SessionConfig{
-//		Hooks: &claude.Hooks{
-//			OnMessage:  func(msg claude.StreamMessage) { log.Printf("msg: %s", msg.Type) },
-//			OnToolCall: func(name string, input map[string]any) { log.Printf("tool: %s", name) },
-//			OnError:    func(err error) { log.Printf("error: %v", err) },
+//	&claude.Hooks{
+//		OnStart:    func(pid int) { ... },            // Process started
+//		OnMessage:  func(msg StreamMessage) { ... },   // Any message parsed
+//		OnText:     func(text string) { ... },         // Text extracted
+//		OnToolCall: func(name string, input map[string]any) { ... }, // Tool invoked
+//		OnMetrics:  func(m SessionMetrics) { ... },    // Metrics available
+//		OnError:    func(err error) { ... },           // Non-fatal error
+//		OnExit:     func(code int, d time.Duration) { ... }, // Process exited
+//	}
+//
+// All hooks and the Hooks pointer itself are nil-safe.
+//
+// # MCP Servers
+//
+// External tool providers are configured via [MCPServer] and passed to Claude
+// through the MCPServers field. Supports stdio, HTTP, and SSE transports:
+//
+//	MCPServers: map[string]claude.MCPServer{
+//		"context7": {Command: "npx", Args: []string{"-y", "@upstash/context7-mcp"}},
+//		"my-api":   {Type: "http", URL: "https://api.example.com/mcp/"},
+//	}
+//
+// # Custom Agents
+//
+// Define specialized subagents via [AgentDefinition] that Claude can invoke
+// through the Task tool:
+//
+//	Agents: map[string]claude.AgentDefinition{
+//		"reviewer": {
+//			Description: "Reviews code for bugs",
+//			Prompt:      "You are a code reviewer...",
+//			Tools:       []string{"Read", "Grep"},
+//			Model:       "sonnet",
 //		},
-//	})
+//	}
 //
 // # Requirements
 //
-// The Claude CLI must be installed and available in PATH. Use [CLIAvailable] to check:
+// The Claude CLI must be installed and available in PATH:
 //
-//	if !claude.CLIAvailable() {
-//		log.Fatal("Claude CLI not found in PATH")
+//	npm install -g @anthropic-ai/claude-code
+//
+// Use [CLIAvailable] to check, or [MustCLIAvailable] for fail-fast:
+//
+//	func init() {
+//		claude.MustCLIAvailable()
 //	}
 package claude

@@ -75,6 +75,46 @@ func ExtractAllText(msg *StreamMessage) string {
 	return result
 }
 
+// ExtractThinking extracts the first thinking/reasoning content from a message.
+//
+// Returns empty string if the message doesn't contain thinking blocks.
+// Thinking blocks appear when Claude uses extended thinking.
+func ExtractThinking(msg *StreamMessage) string {
+	if msg == nil || msg.Message == nil {
+		return ""
+	}
+
+	for _, c := range msg.Message.Content {
+		if c.Type == "thinking" && c.Thinking != "" {
+			return c.Thinking
+		}
+	}
+
+	return ""
+}
+
+// ExtractAllThinking extracts all thinking content from a message,
+// concatenated with newlines.
+//
+// Returns empty string if no thinking blocks are found.
+func ExtractAllThinking(msg *StreamMessage) string {
+	if msg == nil || msg.Message == nil {
+		return ""
+	}
+
+	var result string
+	for _, c := range msg.Message.Content {
+		if c.Type == "thinking" && c.Thinking != "" {
+			if result != "" {
+				result += "\n"
+			}
+			result += c.Thinking
+		}
+	}
+
+	return result
+}
+
 // ExtractTodos extracts todo items from a TodoWrite tool call.
 //
 // Returns nil if the message doesn't contain a TodoWrite tool call.
@@ -240,6 +280,49 @@ func ExtractAllFileAccess(msg *StreamMessage) []string {
 	return paths
 }
 
+// ExtractStructuredOutput extracts validated JSON output from a result message.
+//
+// Returns nil if the message is not a result or has no structured output.
+// The returned type depends on the JSON schema used; typically map[string]any.
+func ExtractStructuredOutput(msg *StreamMessage) any {
+	if msg == nil || msg.Type != "result" {
+		return nil
+	}
+	return msg.StructuredOutput
+}
+
+// ExtractUsage extracts token usage data from a result message.
+//
+// Returns nil if the message is not a result or has no usage data.
+func ExtractUsage(msg *StreamMessage) *Usage {
+	if msg == nil || msg.Type != "result" {
+		return nil
+	}
+	return msg.Usage
+}
+
+// ExtractInitTools extracts the list of available tool names from an init message.
+//
+// Returns nil if the message is not a system init message.
+func ExtractInitTools(msg *StreamMessage) []string {
+	if msg == nil || msg.Type != "system" || msg.Subtype != "init" {
+		return nil
+	}
+	return msg.Tools
+}
+
+// ExtractInitPermissionMode extracts the permission mode from an init message.
+//
+// Returns empty string if the message is not a system init message.
+func ExtractInitPermissionMode(msg *StreamMessage) string {
+	if msg == nil || msg.Type != "system" || msg.Subtype != "init" {
+		return ""
+	}
+	return msg.PermissionMode
+}
+
+// --- Message type predicates ---
+
 // IsResult returns true if this is a final result message with metrics.
 func IsResult(msg *StreamMessage) bool {
 	return msg != nil && msg.Type == "result"
@@ -253,6 +336,21 @@ func IsError(msg *StreamMessage) bool {
 // IsAssistant returns true if this is an assistant response message.
 func IsAssistant(msg *StreamMessage) bool {
 	return msg != nil && msg.Type == "assistant"
+}
+
+// IsSystem returns true if this is a system message.
+func IsSystem(msg *StreamMessage) bool {
+	return msg != nil && msg.Type == "system"
+}
+
+// IsInit returns true if this is a system init message (first message in stream).
+func IsInit(msg *StreamMessage) bool {
+	return msg != nil && msg.Type == "system" && msg.Subtype == "init"
+}
+
+// IsUser returns true if this is a user/tool-result message.
+func IsUser(msg *StreamMessage) bool {
+	return msg != nil && msg.Type == "user"
 }
 
 // getString safely extracts a string from a map.
