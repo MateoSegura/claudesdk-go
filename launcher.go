@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"syscall"
@@ -42,12 +43,13 @@ import (
 //		fmt.Println(claude.ExtractText(msg))
 //	}
 type Launcher struct {
-	cmd       *exec.Cmd
-	stdout    *bufio.Scanner
-	stderr    io.ReadCloser
-	stderrBuf []byte
-	startTime time.Time
-	hooks     *Hooks
+	cmd           *exec.Cmd
+	stdout        *bufio.Scanner
+	stderr        io.ReadCloser
+	stderrBuf     []byte
+	startTime     time.Time
+	hooks         *Hooks
+	mcpConfigFile string // temp file for MCP config, cleaned up on Wait
 
 	mu      sync.Mutex
 	started bool
@@ -106,6 +108,28 @@ func (l *Launcher) Start(ctx context.Context, prompt string, opts LaunchOptions)
 
 	if opts.MaxTurns > 0 {
 		args = append(args, "--max-turns", strconv.Itoa(opts.MaxTurns))
+	}
+
+	// MCP server configuration
+	if len(opts.MCPServers) > 0 {
+		mcpJSON, err := json.Marshal(opts.MCPServers)
+		if err != nil {
+			return &StartError{Err: fmt.Errorf("marshal mcp config: %w", err)}
+		}
+
+		// Write to temp file since inline JSON with special chars can be tricky
+		tmpDir := os.TempDir()
+		mcpFile := filepath.Join(tmpDir, fmt.Sprintf("claude-mcp-%d.json", time.Now().UnixNano()))
+		if err := os.WriteFile(mcpFile, mcpJSON, 0600); err != nil {
+			return &StartError{Err: fmt.Errorf("write mcp config: %w", err)}
+		}
+		l.mcpConfigFile = mcpFile
+
+		args = append(args, "--mcp-config", mcpFile)
+	}
+
+	if opts.StrictMCP {
+		args = append(args, "--strict-mcp-config")
 	}
 
 	// Note: --verbose is already added above (required for stream-json)
@@ -232,6 +256,11 @@ func (l *Launcher) Wait() error {
 	l.mu.Unlock()
 
 	err := l.cmd.Wait()
+
+	// Clean up temp MCP config file
+	if l.mcpConfigFile != "" {
+		os.Remove(l.mcpConfigFile)
+	}
 
 	// Close done channel
 	l.mu.Lock()

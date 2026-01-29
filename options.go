@@ -36,6 +36,21 @@ type LaunchOptions struct {
 	// Verbose enables verbose output from Claude CLI.
 	Verbose bool
 
+	// MCPServers configures MCP servers for this session.
+	// Each entry maps a server name to its configuration.
+	// Passed to Claude via --mcp-config as inline JSON.
+	//
+	// Example:
+	//
+	//	MCPServers: map[string]claude.MCPServer{
+	//		"context7": {Command: "npx", Args: []string{"-y", "@upstash/context7-mcp"}},
+	//	}
+	MCPServers map[string]MCPServer
+
+	// StrictMCP when true, only uses MCP servers from MCPServers,
+	// ignoring all other configured MCP servers.
+	StrictMCP bool
+
 	// AdditionalArgs allows passing extra CLI arguments.
 	// Use sparingly; prefer structured options.
 	AdditionalArgs []string
@@ -76,12 +91,61 @@ type SessionConfig struct {
 	// Verbose enables verbose output from Claude CLI.
 	Verbose bool
 
+	// MCPServers configures MCP servers for this session.
+	MCPServers map[string]MCPServer
+
+	// StrictMCP when true, only uses MCP servers from MCPServers.
+	StrictMCP bool
+
 	// ChannelBuffer sets the buffer size for message channels.
 	// Defaults to 100 if zero.
 	ChannelBuffer int
 
 	// Hooks for observability. Nil is safe.
 	Hooks *Hooks
+}
+
+// MCPServer configures an MCP server for a Claude session.
+//
+// Supports two transport types:
+//   - stdio (default): Set Command and Args to spawn a subprocess
+//   - HTTP/SSE: Set Type to "http" or "sse" and provide URL
+//
+// Example (stdio):
+//
+//	claude.MCPServer{
+//		Command: "npx",
+//		Args:    []string{"-y", "@upstash/context7-mcp"},
+//	}
+//
+// Example (HTTP):
+//
+//	claude.MCPServer{
+//		Type: "http",
+//		URL:  "https://api.example.com/mcp/",
+//		Headers: map[string]string{
+//			"Authorization": "Bearer token",
+//		},
+//	}
+type MCPServer struct {
+	// Command is the executable to run (stdio transport).
+	Command string `json:"command,omitempty"`
+
+	// Args are the command arguments (stdio transport).
+	Args []string `json:"args,omitempty"`
+
+	// Env sets environment variables for the server process (stdio transport).
+	Env map[string]string `json:"env,omitempty"`
+
+	// Type is the transport type: "http" or "sse".
+	// Leave empty for stdio (default).
+	Type string `json:"type,omitempty"`
+
+	// URL is the server endpoint (http/sse transport).
+	URL string `json:"url,omitempty"`
+
+	// Headers are HTTP headers (http/sse transport).
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // Hooks provides optional callbacks for observability.

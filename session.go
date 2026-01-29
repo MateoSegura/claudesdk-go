@@ -107,6 +107,8 @@ func (s *Session) Run(ctx context.Context, prompt string) error {
 		MaxTurns:        s.config.MaxTurns,
 		Timeout:         s.config.Timeout,
 		Verbose:         s.config.Verbose,
+		MCPServers:      s.config.MCPServers,
+		StrictMCP:       s.config.StrictMCP,
 		Hooks:           s.config.Hooks,
 	}
 
