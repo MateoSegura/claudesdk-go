@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -43,13 +44,13 @@ import (
 //		fmt.Println(claude.ExtractText(msg))
 //	}
 type Launcher struct {
-	cmd           *exec.Cmd
-	stdout        *bufio.Scanner
-	stderr        io.ReadCloser
-	stderrBuf     []byte
-	startTime     time.Time
-	hooks         *Hooks
-	mcpConfigFile string // temp file for MCP config, cleaned up on Wait
+	cmd       *exec.Cmd
+	stdout    *bufio.Scanner
+	stderr    io.ReadCloser
+	stderrBuf []byte
+	startTime time.Time
+	hooks     *Hooks
+	tempFiles []string // temp files cleaned up on Wait
 
 	mu      sync.Mutex
 	started bool
@@ -63,6 +64,191 @@ func NewLauncher() *Launcher {
 	return &Launcher{
 		done: make(chan struct{}),
 	}
+}
+
+// buildArgs constructs CLI arguments from LaunchOptions.
+// mcpConfigFile is the path to a temporary MCP config file (empty if none).
+// The prompt is appended at the end.
+func buildArgs(prompt string, opts LaunchOptions, mcpConfigFile string) ([]string, error) {
+	// Required flags for SDK mode
+	args := []string{
+		"--print",
+		"--output-format", "stream-json",
+		"--verbose",
+	}
+
+	// --- Permission & Security ---
+
+	if opts.PermissionMode != "" {
+		args = append(args, "--permission-mode", string(opts.PermissionMode))
+	} else if opts.SkipPermissions {
+		args = append(args, "--dangerously-skip-permissions")
+	}
+
+	if opts.AllowDangerouslySkipPermissions {
+		args = append(args, "--allow-dangerously-skip-permissions")
+	}
+
+	for _, t := range opts.AllowedTools {
+		args = append(args, "--allowedTools", t)
+	}
+
+	for _, t := range opts.DisallowedTools {
+		args = append(args, "--disallowedTools", t)
+	}
+
+	if opts.PermissionPromptTool != "" {
+		args = append(args, "--permission-prompt-tool", opts.PermissionPromptTool)
+	}
+
+	// --- Model & Budget ---
+
+	if opts.Model != "" {
+		args = append(args, "--model", opts.Model)
+	}
+
+	if opts.FallbackModel != "" {
+		args = append(args, "--fallback-model", opts.FallbackModel)
+	}
+
+	if opts.MaxBudgetUSD > 0 {
+		args = append(args, "--max-budget-usd", strconv.FormatFloat(opts.MaxBudgetUSD, 'f', 2, 64))
+	}
+
+	if len(opts.Betas) > 0 {
+		args = append(args, "--betas", strings.Join(opts.Betas, ","))
+	}
+
+	// --- System Prompt ---
+
+	if opts.SystemPrompt != "" {
+		args = append(args, "--system-prompt", opts.SystemPrompt)
+	} else if opts.SystemPromptFile != "" {
+		args = append(args, "--system-prompt-file", opts.SystemPromptFile)
+	}
+
+	if opts.AppendSystemPrompt != "" {
+		args = append(args, "--append-system-prompt", opts.AppendSystemPrompt)
+	}
+
+	if opts.AppendSystemPromptFile != "" {
+		args = append(args, "--append-system-prompt-file", opts.AppendSystemPromptFile)
+	}
+
+	// --- Session Management ---
+
+	if opts.Resume != "" {
+		args = append(args, "--resume", opts.Resume)
+	}
+
+	if opts.Continue {
+		args = append(args, "--continue")
+	}
+
+	if opts.ForkSession {
+		args = append(args, "--fork-session")
+	}
+
+	if opts.SessionID != "" {
+		args = append(args, "--session-id", opts.SessionID)
+	}
+
+	if opts.NoSessionPersistence {
+		args = append(args, "--no-session-persistence")
+	}
+
+	// --- Limits ---
+
+	if opts.MaxTurns > 0 {
+		args = append(args, "--max-turns", strconv.Itoa(opts.MaxTurns))
+	}
+
+	// --- Tools & Agents ---
+
+	if len(opts.Tools) > 0 {
+		args = append(args, "--tools", strings.Join(opts.Tools, ","))
+	}
+
+	if len(opts.Agents) > 0 {
+		agentsJSON, err := json.Marshal(opts.Agents)
+		if err != nil {
+			return nil, fmt.Errorf("marshal agents: %w", err)
+		}
+		args = append(args, "--agents", string(agentsJSON))
+	}
+
+	if opts.DisableSlashCommands {
+		args = append(args, "--disable-slash-commands")
+	}
+
+	// --- Input/Output ---
+
+	if opts.JSONSchema != nil {
+		schemaJSON, err := json.Marshal(opts.JSONSchema)
+		if err != nil {
+			return nil, fmt.Errorf("marshal json schema: %w", err)
+		}
+		args = append(args, "--json-schema", string(schemaJSON))
+	}
+
+	if opts.IncludePartialMessages {
+		args = append(args, "--include-partial-messages")
+	}
+
+	if opts.InputFormat != "" {
+		args = append(args, "--input-format", opts.InputFormat)
+	}
+
+	// --- Configuration ---
+
+	if len(opts.SettingSources) > 0 {
+		args = append(args, "--setting-sources", strings.Join(opts.SettingSources, ","))
+	}
+
+	if opts.Settings != "" {
+		args = append(args, "--settings", opts.Settings)
+	}
+
+	for _, dir := range opts.PluginDirs {
+		args = append(args, "--plugin-dir", dir)
+	}
+
+	for _, dir := range opts.AddDirs {
+		args = append(args, "--add-dir", dir)
+	}
+
+	// --- MCP ---
+
+	if mcpConfigFile != "" {
+		args = append(args, "--mcp-config", mcpConfigFile)
+	}
+
+	if opts.StrictMCP {
+		args = append(args, "--strict-mcp-config")
+	}
+
+	// --- Debug ---
+
+	if opts.Debug != "" {
+		args = append(args, "--debug", opts.Debug)
+	}
+
+	if opts.Chrome != nil {
+		if *opts.Chrome {
+			args = append(args, "--chrome")
+		} else {
+			args = append(args, "--no-chrome")
+		}
+	}
+
+	// --- Advanced ---
+
+	args = append(args, opts.AdditionalArgs...)
+
+	// Prompt must be last
+	args = append(args, prompt)
+
+	return args, nil
 }
 
 // Start launches Claude CLI with the given prompt.
@@ -86,73 +272,54 @@ func (l *Launcher) Start(ctx context.Context, prompt string, opts LaunchOptions)
 		return ErrCLINotFound
 	}
 
-	// Build arguments
-	// Note: --verbose is required when using --output-format=stream-json
-	args := []string{
-		"--print",
-		"--output-format", "stream-json",
-		"--verbose",
-	}
-
-	if opts.SkipPermissions {
-		args = append(args, "--dangerously-skip-permissions")
-	}
-
-	if opts.Model != "" {
-		args = append(args, "--model", opts.Model)
-	}
-
-	if opts.SystemPrompt != "" {
-		args = append(args, "--system-prompt", opts.SystemPrompt)
-	}
-
-	if opts.MaxTurns > 0 {
-		args = append(args, "--max-turns", strconv.Itoa(opts.MaxTurns))
-	}
-
-	// MCP server configuration
+	// Handle MCP server configuration (requires temp file)
+	var mcpConfigFile string
 	if len(opts.MCPServers) > 0 {
 		mcpJSON, err := json.Marshal(opts.MCPServers)
 		if err != nil {
 			return &StartError{Err: fmt.Errorf("marshal mcp config: %w", err)}
 		}
 
-		// Write to temp file since inline JSON with special chars can be tricky
 		tmpDir := os.TempDir()
 		mcpFile := filepath.Join(tmpDir, fmt.Sprintf("claude-mcp-%d.json", time.Now().UnixNano()))
 		if err := os.WriteFile(mcpFile, mcpJSON, 0600); err != nil {
 			return &StartError{Err: fmt.Errorf("write mcp config: %w", err)}
 		}
-		l.mcpConfigFile = mcpFile
-
-		args = append(args, "--mcp-config", mcpFile)
+		mcpConfigFile = mcpFile
+		l.tempFiles = append(l.tempFiles, mcpFile)
 	}
 
-	if opts.StrictMCP {
-		args = append(args, "--strict-mcp-config")
+	// Build arguments
+	args, err := buildArgs(prompt, opts, mcpConfigFile)
+	if err != nil {
+		return &StartError{Err: err}
 	}
-
-	// Note: --verbose is already added above (required for stream-json)
-	// opts.Verbose is ignored since we always need verbose mode
-
-	args = append(args, opts.AdditionalArgs...)
-	args = append(args, prompt)
 
 	// Apply timeout to context if specified
 	if opts.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, opts.Timeout)
-		// Store cancel func to call on close - but we don't have a good place
-		// Instead, rely on Wait() being called which will clean up
-		_ = cancel
+		_ = cancel // cleaned up when process exits
 	}
 
 	l.cmd = exec.CommandContext(ctx, binaryPath, args...)
+
+	// Build environment
 	l.cmd.Env = os.Environ()
 
-	// Set API key if provided (overrides any existing ANTHROPIC_API_KEY)
+	// Set API key
 	if opts.APIKey != "" {
 		l.cmd.Env = withEnvVar(l.cmd.Env, "ANTHROPIC_API_KEY", opts.APIKey)
+	}
+
+	// Set max thinking tokens
+	if opts.MaxThinkingTokens > 0 {
+		l.cmd.Env = withEnvVar(l.cmd.Env, "MAX_THINKING_TOKENS", strconv.Itoa(opts.MaxThinkingTokens))
+	}
+
+	// Merge additional environment variables
+	for k, v := range opts.Env {
+		l.cmd.Env = withEnvVar(l.cmd.Env, k, v)
 	}
 
 	if opts.WorkDir != "" {
@@ -240,7 +407,33 @@ func (l *Launcher) ReadMessage() (*StreamMessage, error) {
 		l.hooks.invokeToolCall(name, input)
 	}
 
+	// Invoke metrics hook for result messages
+	if msg.Type == "result" {
+		m := metricsFromMessage(&msg)
+		l.hooks.invokeMetrics(m)
+	}
+
 	return &msg, nil
+}
+
+// metricsFromMessage extracts SessionMetrics from a result StreamMessage.
+func metricsFromMessage(msg *StreamMessage) SessionMetrics {
+	m := SessionMetrics{
+		CostUSD:       msg.CostUSD,
+		TotalCostUSD:  msg.TotalCost,
+		NumTurns:      msg.NumTurns,
+		DurationMS:    msg.DurationMS,
+		DurationAPIMS: msg.DurationAPIMS,
+		Model:         msg.Model,
+		SessionID:     msg.SessionID,
+	}
+	if msg.Usage != nil {
+		m.InputTokens = msg.Usage.InputTokens
+		m.OutputTokens = msg.Usage.OutputTokens
+		m.CacheCreationInputTokens = msg.Usage.CacheCreationInputTokens
+		m.CacheReadInputTokens = msg.Usage.CacheReadInputTokens
+	}
+	return m
 }
 
 // Wait blocks until Claude exits and returns any error.
@@ -257,9 +450,9 @@ func (l *Launcher) Wait() error {
 
 	err := l.cmd.Wait()
 
-	// Clean up temp MCP config file
-	if l.mcpConfigFile != "" {
-		os.Remove(l.mcpConfigFile)
+	// Clean up temp files
+	for _, f := range l.tempFiles {
+		os.Remove(f)
 	}
 
 	// Close done channel

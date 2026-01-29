@@ -11,8 +11,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -81,83 +83,97 @@ func main() {
 	filesAccessed := []string{}
 	startTime := time.Now()
 
+	// Waiting indicator — MCP servers (npx) can take a while to download and boot.
+	// We spin a goroutine that prints dots until the first real message arrives.
+	firstMessage := make(chan struct{})
+	var firstOnce sync.Once
+
 	// Header
 	fmt.Fprintf(os.Stderr, "\n%s%s claudesdk-go tools example %s\n", bold, cyan, reset)
 	fmt.Fprintf(os.Stderr, "%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n\n", dim, reset)
 
 	session, err := claude.NewSession(claude.SessionConfig{
-		SkipPermissions: true,
-		WorkDir:         ".",
-		Timeout:         5 * time.Minute,
-		MaxTurns:        15,
+		LaunchOptions: claude.LaunchOptions{
+			SkipPermissions: true,
+			WorkDir:         ".",
+			Timeout:         5 * time.Minute,
+			MaxTurns:        15,
 
-		MCPServers: map[string]claude.MCPServer{
-			"context7": {
-				Command: "npx",
-				Args:    []string{"-y", "@upstash/context7-mcp"},
-			},
-		},
+			// Pre-install for fast startup: npm install -g @upstash/context7-mcp
+			// Falls back to npx (slow) if not globally installed.
+			// MCPServers: map[string]claude.MCPServer{
+			// 	"context7": context7Server(),
+			// },
 
-		Hooks: &claude.Hooks{
-			OnStart: func(pid int) {
-				fmt.Fprintf(os.Stderr, "%s%s PID %d %s\n\n", dim, green, pid, reset)
-			},
-			OnToolCall: func(name string, input map[string]any) {
-				toolCalls[name]++
-				color := toolColor(name)
+			Hooks: &claude.Hooks{
+				OnStart: func(pid int) {
+					fmt.Fprintf(os.Stderr, "  %sPID %d%s\n", dim, pid, reset)
+					fmt.Fprintf(os.Stderr, "  %sStarting MCP servers (npx install)...%s", dim, reset)
+				},
+				OnMessage: func(msg claude.StreamMessage) {
+					firstOnce.Do(func() { close(firstMessage) })
+				},
+				OnToolCall: func(name string, input map[string]any) {
+					toolCalls[name]++
+					color := toolColor(name)
 
-				// Clean up MCP tool names for display
-				displayName := name
-				if strings.HasPrefix(name, "mcp__") {
-					parts := strings.Split(name, "__")
-					if len(parts) >= 3 {
-						displayName = fmt.Sprintf("%s → %s", parts[1], parts[2])
-					}
-				}
-
-				// Show a one-line summary depending on tool type
-				detail := ""
-				switch name {
-				case "Bash":
-					if cmd, ok := input["command"].(string); ok {
-						cmd = strings.Split(cmd, "\n")[0]
-						if len(cmd) > 60 {
-							cmd = cmd[:57] + "..."
-						}
-						detail = fmt.Sprintf(" %s$ %s%s", dim, cmd, reset)
-					}
-				case "Read":
-					if fp, ok := input["file_path"].(string); ok {
-						detail = fmt.Sprintf(" %s%s%s", dim, fp, reset)
-						filesAccessed = append(filesAccessed, fp)
-					}
-				case "Write", "Edit":
-					if fp, ok := input["file_path"].(string); ok {
-						detail = fmt.Sprintf(" %s%s%s", dim, fp, reset)
-						filesAccessed = append(filesAccessed, fp)
-					}
-				case "Grep", "Glob":
-					if p, ok := input["pattern"].(string); ok {
-						detail = fmt.Sprintf(" %s%s%s", dim, p, reset)
-					}
-				default:
+					// Clean up MCP tool names for display
+					displayName := name
 					if strings.HasPrefix(name, "mcp__") {
-						if q, ok := input["query"].(string); ok {
-							if len(q) > 50 {
-								q = q[:47] + "..."
-							}
-							detail = fmt.Sprintf(" %s\"%s\"%s", dim, q, reset)
-						}
-						if lib, ok := input["libraryName"].(string); ok {
-							detail = fmt.Sprintf(" %s%s%s", dim, lib, reset)
+						parts := strings.Split(name, "__")
+						if len(parts) >= 3 {
+							displayName = fmt.Sprintf("%s → %s", parts[1], parts[2])
 						}
 					}
-				}
 
-				fmt.Fprintf(os.Stderr, "  %s%s● %s%s%s\n", color, bold, displayName, reset, detail)
-			},
-			OnExit: func(code int, duration time.Duration) {
-				fmt.Fprintf(os.Stderr, "\n")
+					// Show contextual detail
+					detail := ""
+					switch name {
+					case "Bash":
+						if cmd, ok := input["command"].(string); ok {
+							cmd = strings.Split(cmd, "\n")[0]
+							if len(cmd) > 60 {
+								cmd = cmd[:57] + "..."
+							}
+							detail = fmt.Sprintf(" %s$ %s%s", dim, cmd, reset)
+						}
+					case "Read":
+						if fp, ok := input["file_path"].(string); ok {
+							detail = fmt.Sprintf(" %s%s%s", dim, fp, reset)
+							filesAccessed = append(filesAccessed, fp)
+						}
+					case "Write", "Edit":
+						if fp, ok := input["file_path"].(string); ok {
+							detail = fmt.Sprintf(" %s%s%s", dim, fp, reset)
+							filesAccessed = append(filesAccessed, fp)
+						}
+					case "Grep", "Glob":
+						if p, ok := input["pattern"].(string); ok {
+							detail = fmt.Sprintf(" %s%s%s", dim, p, reset)
+						}
+					default:
+						if strings.HasPrefix(name, "mcp__") {
+							if q, ok := input["query"].(string); ok {
+								if len(q) > 50 {
+									q = q[:47] + "..."
+								}
+								detail = fmt.Sprintf(" %s\"%s\"%s", dim, q, reset)
+							}
+							if lib, ok := input["libraryName"].(string); ok {
+								detail = fmt.Sprintf(" %s%s%s", dim, lib, reset)
+							}
+						}
+					}
+
+					fmt.Fprintf(os.Stderr, "  %s%s● %s%s%s\n", color, bold, displayName, reset, detail)
+				},
+				OnExit: func(code int, duration time.Duration) {
+					fmt.Fprintf(os.Stderr, "\n")
+				},
+				OnMetrics: func(m claude.SessionMetrics) {
+					fmt.Fprintf(os.Stderr, "  %sTokens: %d in / %d out%s\n",
+						dim, m.InputTokens, m.OutputTokens, reset)
+				},
 			},
 		},
 	})
@@ -183,8 +199,26 @@ func main() {
 		log.Fatalf("Failed to start: %v", err)
 	}
 
+	// Waiting animation while MCP servers boot
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-firstMessage:
+				elapsed := time.Since(startTime).Round(time.Millisecond)
+				fmt.Fprintf(os.Stderr, " %sready (%s)%s\n\n", green, elapsed, reset)
+				return
+			case <-ticker.C:
+				fmt.Fprintf(os.Stderr, "%s.%s", dim, reset)
+			case <-ctx.Done():
+				fmt.Fprintf(os.Stderr, "\n")
+				return
+			}
+		}
+	}()
+
 	// Print text in real time, tools via hooks above
-	var fullText strings.Builder
 	for {
 		select {
 		case msg, ok := <-session.Messages:
@@ -195,18 +229,21 @@ func main() {
 			if msg.Type == "assistant" {
 				if text := claude.ExtractText(&msg); text != "" {
 					fmt.Print(text)
-					fullText.WriteString(text)
 				}
 			}
 
-			// Capture result metrics
+			// Summary on result
 			if claude.IsResult(&msg) {
-				// Summary banner
 				elapsed := time.Since(startTime)
 				fmt.Fprintf(os.Stderr, "%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n", dim, reset)
 				fmt.Fprintf(os.Stderr, "%s%s Summary%s\n", bold, cyan, reset)
 				fmt.Fprintf(os.Stderr, "  Duration   %s%s%s\n", white, elapsed.Round(time.Millisecond), reset)
 				fmt.Fprintf(os.Stderr, "  Cost       %s$%.6f%s\n", green, msg.TotalCost, reset)
+
+				if msg.Usage != nil {
+					fmt.Fprintf(os.Stderr, "  Tokens     %sin=%d out=%d%s\n",
+						white, msg.Usage.InputTokens, msg.Usage.OutputTokens, reset)
+				}
 
 				if len(toolCalls) > 0 {
 					fmt.Fprintf(os.Stderr, "  Tools\n")
@@ -247,5 +284,17 @@ func main() {
 done:
 	if err := session.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "%sSession error: %v%s\n", red, err, reset)
+	}
+}
+
+// context7Server returns an MCPServer config that uses the global binary
+// if available, falling back to npx.
+func context7Server() claude.MCPServer {
+	if _, err := exec.LookPath("context7-mcp"); err == nil {
+		return claude.MCPServer{Command: "context7-mcp"}
+	}
+	return claude.MCPServer{
+		Command: "npx",
+		Args:    []string{"-y", "@upstash/context7-mcp"},
 	}
 }

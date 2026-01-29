@@ -2,10 +2,11 @@ package claude
 
 import (
 	"os/exec"
+	"strings"
 )
 
 // Version is the SDK version.
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 // DefaultBinary is the expected Claude CLI binary name.
 const DefaultBinary = "claude"
@@ -35,7 +36,7 @@ func CLIVersion() (string, error) {
 		return "", err
 	}
 
-	return string(out), nil
+	return strings.TrimSpace(string(out)), nil
 }
 
 // MustCLIAvailable panics if the Claude CLI is not available.

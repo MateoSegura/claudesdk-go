@@ -17,8 +17,10 @@ import (
 // Example:
 //
 //	session, err := claude.NewSession(claude.SessionConfig{
-//		WorkDir: "/path/to/project",
-//		Model:   "sonnet",
+//		LaunchOptions: claude.LaunchOptions{
+//			Model:           "sonnet",
+//			SkipPermissions: true,
+//		},
 //	})
 //	if err != nil {
 //		log.Fatal(err)
@@ -50,10 +52,11 @@ type Session struct {
 	launcher *Launcher
 	config   SessionConfig
 
-	mu     sync.Mutex
-	closed bool
-	done   chan struct{}
-	err    error
+	mu      sync.Mutex
+	closed  bool
+	done    chan struct{}
+	err     error
+	metrics SessionMetrics
 }
 
 // NewSession creates a new Session with the given configuration.
@@ -98,21 +101,7 @@ func (s *Session) Run(ctx context.Context, prompt string) error {
 
 	s.launcher = NewLauncher()
 
-	opts := LaunchOptions{
-		APIKey:          s.config.APIKey,
-		SkipPermissions: s.config.SkipPermissions,
-		WorkDir:         s.config.WorkDir,
-		Model:           s.config.Model,
-		SystemPrompt:    s.config.SystemPrompt,
-		MaxTurns:        s.config.MaxTurns,
-		Timeout:         s.config.Timeout,
-		Verbose:         s.config.Verbose,
-		MCPServers:      s.config.MCPServers,
-		StrictMCP:       s.config.StrictMCP,
-		Hooks:           s.config.Hooks,
-	}
-
-	if err := s.launcher.Start(ctx, prompt, opts); err != nil {
+	if err := s.launcher.Start(ctx, prompt, s.config.LaunchOptions); err != nil {
 		s.close()
 		return err
 	}
@@ -148,6 +137,22 @@ func (s *Session) readLoop() {
 			if text := ExtractText(msg); text != "" {
 				s.sendText(text)
 			}
+		}
+
+		// Update metrics from result messages
+		if msg.Type == "result" {
+			m := metricsFromMessage(msg)
+			s.mu.Lock()
+			s.metrics = m
+			s.mu.Unlock()
+		}
+
+		// Capture session info from system init message
+		if msg.Type == "system" && msg.Subtype == "init" && msg.SessionID != "" {
+			s.mu.Lock()
+			s.metrics.SessionID = msg.SessionID
+			s.metrics.Model = msg.Model
+			s.mu.Unlock()
 		}
 	}
 }
@@ -225,6 +230,18 @@ func (s *Session) Wait() error {
 	return s.Err()
 }
 
+// CurrentMetrics returns the latest accumulated session metrics.
+//
+// Safe to call from any goroutine at any time. Returns zero-value
+// SessionMetrics until the result message arrives.
+//
+// For async metrics delivery, use the OnMetrics hook instead.
+func (s *Session) CurrentMetrics() SessionMetrics {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.metrics
+}
+
 // Interrupt sends SIGINT to Claude for graceful shutdown.
 func (s *Session) Interrupt() error {
 	if s.launcher == nil {
@@ -271,8 +288,6 @@ func (s *Session) CollectAll(ctx context.Context, prompt string) (string, error)
 
 		case err, ok := <-s.Errors:
 			if ok && err != nil {
-				// Log non-fatal errors but continue
-				// Could expose these via a callback if needed
 				_ = err
 			}
 
@@ -337,20 +352,38 @@ type Result struct {
 	// TotalCost is the total cost in USD.
 	TotalCost float64
 
+	// CostUSD is the cost for this specific invocation.
+	CostUSD float64
+
 	// Duration is the total runtime.
 	Duration time.Duration
+
+	// DurationAPI is the API-only duration (excludes tool execution time).
+	DurationAPI time.Duration
 
 	// Model is the model that was used.
 	Model string
 
 	// SessionID is Claude's session identifier.
 	SessionID string
+
+	// NumTurns is the number of agentic turns completed.
+	NumTurns int
+
+	// Usage contains token consumption data. Nil if not available.
+	Usage *Usage
+
+	// StructuredOutput contains validated JSON when --json-schema was used.
+	StructuredOutput any
+
+	// Metrics is the full session metrics snapshot.
+	Metrics SessionMetrics
 }
 
 // RunAndCollect runs a prompt and returns a comprehensive Result.
 //
 // This is the most complete collection method, returning text, messages,
-// and all available metadata.
+// and all available metadata including cost, tokens, and structured output.
 func (s *Session) RunAndCollect(ctx context.Context, prompt string) (*Result, error) {
 	if err := s.Run(ctx, prompt); err != nil {
 		return nil, err
@@ -366,13 +399,13 @@ func (s *Session) RunAndCollect(ctx context.Context, prompt string) (*Result, er
 			if !ok {
 				result.Duration = time.Since(startTime)
 				result.Text = textBuilder.String()
+				result.Metrics = s.CurrentMetrics()
 				return result, s.Err()
 			}
 
 			result.Messages = append(result.Messages, msg)
 
 			// Only collect text from assistant messages to avoid duplicates.
-			// Result messages repeat the same text content.
 			if msg.Type == "assistant" {
 				if text := ExtractText(&msg); text != "" {
 					textBuilder.WriteString(text)
@@ -382,14 +415,29 @@ func (s *Session) RunAndCollect(ctx context.Context, prompt string) (*Result, er
 			// Capture metadata from result message
 			if msg.Type == "result" {
 				result.TotalCost = msg.TotalCost
-				result.SessionID = msg.SessionID
-				result.Model = msg.Model
+				result.CostUSD = msg.CostUSD
+				if msg.SessionID != "" {
+					result.SessionID = msg.SessionID
+				}
+				if msg.Model != "" {
+					result.Model = msg.Model
+				}
+				result.NumTurns = msg.NumTurns
+				result.Usage = msg.Usage
+				result.StructuredOutput = msg.StructuredOutput
+				if msg.DurationAPIMS > 0 {
+					result.DurationAPI = time.Duration(msg.DurationAPIMS) * time.Millisecond
+				}
 			}
 
-			// Capture session info from system message
-			if msg.Type == "system" && msg.SessionID != "" {
-				result.SessionID = msg.SessionID
-				result.Model = msg.Model
+			// Capture session info from system init message
+			if msg.Type == "system" && msg.Subtype == "init" {
+				if msg.SessionID != "" {
+					result.SessionID = msg.SessionID
+				}
+				if msg.Model != "" {
+					result.Model = msg.Model
+				}
 			}
 
 		case <-s.Errors:
@@ -406,16 +454,25 @@ func (s *Session) RunAndCollect(ctx context.Context, prompt string) (*Result, er
 				}
 				if msg.Type == "result" {
 					result.TotalCost = msg.TotalCost
+					result.CostUSD = msg.CostUSD
+					result.NumTurns = msg.NumTurns
+					result.Usage = msg.Usage
+					result.StructuredOutput = msg.StructuredOutput
+					if msg.DurationAPIMS > 0 {
+						result.DurationAPI = time.Duration(msg.DurationAPIMS) * time.Millisecond
+					}
 				}
 			}
 			result.Duration = time.Since(startTime)
 			result.Text = textBuilder.String()
+			result.Metrics = s.CurrentMetrics()
 			return result, s.Err()
 
 		case <-ctx.Done():
 			s.Kill()
 			result.Duration = time.Since(startTime)
 			result.Text = textBuilder.String()
+			result.Metrics = s.CurrentMetrics()
 			return result, ctx.Err()
 		}
 	}
