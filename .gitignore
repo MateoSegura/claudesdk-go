@@ -28,3 +28,7 @@ Thumbs.db
 # Build artifacts
 /bin/
 /dist/
+/configbench
+
+# Benchmark results (generated at runtime)
+results/

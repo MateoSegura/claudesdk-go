@@ -275,10 +275,6 @@ type LaunchOptions struct {
 
 	// --- Debug ---
 
-	// Verbose enables verbose logging.
-	// Note: always enabled internally for stream-json output.
-	Verbose bool
-
 	// Debug enables debug mode with optional category filtering.
 	// Example: "api,mcp" to debug API and MCP categories.
 	Debug string

@@ -286,10 +286,8 @@ func (s *Session) CollectAll(ctx context.Context, prompt string) (string, error)
 			}
 			builder.WriteString(text)
 
-		case err, ok := <-s.Errors:
-			if ok && err != nil {
-				_ = err
-			}
+		case <-s.Errors:
+			// Non-fatal errors are ignored in collect mode
 
 		case <-s.Done():
 			// Drain remaining text
